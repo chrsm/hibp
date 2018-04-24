@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -17,11 +18,20 @@ type req struct {
 	passback chan resp
 }
 
+func (r *req) pass(b Breaches, err error) {
+	r.passback <- resp{
+		breaches: b,
+		err:      err,
+	}
+}
+
 type Client struct {
 	xport *http.Client
 
 	requests chan req
-	quit     chan struct{}
+
+	closed bool
+	quit   chan struct{}
 }
 
 func NewClient(xport *http.Client) *Client {
@@ -41,13 +51,17 @@ func NewClient(xport *http.Client) *Client {
 }
 
 func (c *Client) Close() {
+	if c.closed {
+		return
+	}
+
+	c.closed = true
 	c.quit <- struct{}{}
 }
 
-// proc rate limits requests to hibp's 1/s by processing requests;
-// they come in on a channel and are responded to.
+// Rate limit all queries to HIBP's API.
 func (c *Client) proc() {
-	limit := time.Tick(time.Second)
+	limit := time.Tick(time.Second * 2)
 
 lewp:
 	for {
@@ -55,25 +69,28 @@ lewp:
 		case req := <-c.requests:
 			<-limit
 
-			hresp, err := c.xport.Get(fmt.Sprintf("https://haveibeenpwned.com/api/v2/breachedaccount/%s", req.email))
+			get, err := http.NewRequest("GET", fmt.Sprintf("https://haveibeenpwned.com/api/v2/breachedaccount/%s", url.PathEscape(req.email)), nil)
 			if err != nil {
-				// do something
+				req.pass(nil, err)
+				continue
+			}
+
+			get.Header.Set("User-Agent", "Pwn-Checker-Go")
+
+			hresp, err := c.xport.Do(get)
+			if err != nil {
+				req.pass(nil, err)
+				continue
 			}
 			defer hresp.Body.Close()
 
 			if hresp.StatusCode == 200 {
-				var br Breaches
-				json.NewDecoder(hresp.Body).Decode(&br)
+				br := make(Breaches, 0)
+				err := json.NewDecoder(hresp.Body).Decode(&br)
 
-				req.passback <- resp{
-					breaches: br,
-					err:      nil,
-				}
+				req.pass(br, err)
 			} else {
-				req.passback <- resp{
-					breaches: nil,
-					err:      fmt.Errorf("Request error: %d", hresp.StatusCode),
-				}
+				req.pass(nil, fmt.Errorf("Request error: %d", hresp.StatusCode))
 			}
 
 			close(req.passback)
@@ -88,6 +105,10 @@ lewp:
 }
 
 func (c *Client) BreachedAccount(email string) (Breaches, error) {
+	if c.closed {
+		return nil, fmt.Errorf("Attempting to use Client after it has been closed!")
+	}
+
 	cresp := make(chan resp)
 	req := req{
 		email:    email,
